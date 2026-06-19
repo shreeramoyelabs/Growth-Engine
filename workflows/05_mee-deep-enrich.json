@@ -1,0 +1,523 @@
+{
+  "name": "MEE — Deep Enrich (Single Lead)",
+  "nodes": [
+    {
+      "id": "de-01",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "path": "mee-deep-enrich",
+        "responseMode": "responseNode",
+        "httpMethod": "POST",
+        "options": {}
+      },
+      "webhookId": "8e5a2f4d-deep-enrich-mee-2026",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "de-02",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst place_id = body.place_id;\nconst website = body.website;\nconst business_name = body.business_name || 'Unknown';\nif (!place_id) throw new Error('place_id is required');\nif (!website) throw new Error('website is required (lead must have a website)');\nlet url = String(website).trim();\nif (!/^https?:\\/\\//i.test(url)) url = 'https://' + url;\n// Note: n8n task-runner sandbox does not expose the URL constructor, so we\n// validate with a regex instead. Good enough for our use case.\nif (!/^https?:\\/\\/[^\\s]+\\.[^\\s]+/i.test(url)) {\n  throw new Error('Invalid website URL: ' + website);\n}\nreturn [{ json: { place_id, business_name, website: url, started_at: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "de-03",
+      "name": "Start Deep Enrich Run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "continueOnFail": true,
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_SUPABASE_PROJECT_REF.supabase.co/rest/v1/lead_deep_enrichment",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "YOUR_SUPABASE_PUBLISHABLE_KEY"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_SUPABASE_PUBLISHABLE_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ place_id: $json.place_id, status: 'running', triggered_by: 'manual' }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "de-04",
+      "name": "Fetch Homepage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "continueOnFail": true,
+      "parameters": {
+        "url": "={{ $('Validate Input').first().json.website }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.5"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 5
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "de-05",
+      "name": "Clean Homepage + Extract Links",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const homepageResp = $input.first();\nconst html = String(homepageResp.json.data || homepageResp.json.body || homepageResp.json || '');\nconst base = $('Validate Input').first().json.website;\n\n// n8n task-runner sandbox doesn't expose the URL constructor, so we parse manually.\nfunction getOrigin(u) {\n  const m = String(u).match(/^(https?:\\/\\/[^\\/]+)/i);\n  return m ? m[1] : u;\n}\nfunction getPathFromAbs(u) {\n  const m = String(u).match(/^https?:\\/\\/[^\\/]+(\\/[^?#]*)?/i);\n  return (m && m[1]) || '/';\n}\nfunction absolutize(href, baseUrl) {\n  if (!href) return null;\n  href = String(href).trim();\n  if (!href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) return null;\n  // Strip fragment\n  href = href.split('#')[0];\n  if (!href) return null;\n  // Already absolute\n  if (/^https?:\\/\\//i.test(href)) return href;\n  // Protocol-relative\n  if (href.startsWith('//')) {\n    const proto = (baseUrl.match(/^(https?):/i) || [null, 'https'])[1];\n    return proto + ':' + href;\n  }\n  const origin = getOrigin(baseUrl);\n  // Root-relative\n  if (href.startsWith('/')) return origin + href;\n  // Path-relative — append to base directory\n  const basePath = getPathFromAbs(baseUrl).replace(/\\/[^\\/]*$/, '/');\n  return origin + basePath + href;\n}\nconst origin = getOrigin(base);\n\nfunction stripTags(s) {\n  return s\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nconst linkRe = /<a[^>]+href\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;\nconst rawLinks = [];\nlet m;\nwhile ((m = linkRe.exec(html)) !== null) {\n  rawLinks.push({ href: m[1], text: stripTags(m[2]).slice(0, 80) });\n  if (rawLinks.length > 500) break;\n}\n\nconst seen = new Set();\nconst internal = [];\nfor (const l of rawLinks) {\n  const abs = absolutize(l.href, base);\n  if (!abs) continue;\n  const absOrigin = getOrigin(abs);\n  if (absOrigin !== origin) continue;\n  // Dedup by pathname without trailing slash\n  const path = getPathFromAbs(abs).replace(/\\/$/, '') || '/';\n  if (path === '/' || path === '') continue; // skip homepage itself\n  const key = origin + path;\n  if (seen.has(key)) continue;\n  seen.add(key);\n  internal.push({ url: key, text: l.text || '(no text)' });\n  if (internal.length > 80) break;\n}\n\nconst homepageText = stripTags(html).slice(0, 6000);\n\nreturn [{ json: { homepage_text: homepageText, homepage_url: base, links: internal, link_count: internal.length } }];"
+      }
+    },
+    {
+      "id": "de-06",
+      "name": "LLM: Rank Pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "continueOnFail": true,
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GROQ_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ (function(){\n  var biz = $('Validate Input').first().json.business_name;\n  var homepageUrl = $json.homepage_url;\n  var links = ($json.links || []).slice(0, 60);\n  var linksStr = links.map(function(l){ return l.url + '  ::  ' + l.text; }).join('\\n');\n  var system = 'You are a contact-finding assistant for B2B lead research. Given a list of links from a small business website, you pick the pages most likely to contain personal contact info: owner names, direct emails, manager phones, team members. Respond only with valid JSON.';\n  var user = 'Business: ' + biz + '\\nWebsite: ' + homepageUrl + '\\n\\nInternal links found on the homepage (URL :: anchor text):\\n' + linksStr + '\\n\\nPick up to 5 URLs from the list above that are most likely to contain:\\n1. Owner or founder direct contact (highest priority)\\n2. Decision-maker names and titles\\n3. Direct email addresses (john@... not info@...)\\n4. Direct phone numbers tied to a person\\n\\nStrongly prefer paths like: /about, /about-us, /team, /staff, /leadership, /our-story, /contact, /contact-us, /management, /our-people, /meet-the-team, /people, /staff-directory.\\nAvoid: /menu, /reservations, /cart, /shop, /products, /blog (unless anchor text mentions a person).\\n\\nReturn ONLY this JSON, no markdown, no commentary:\\n{\\n  \"rationale\": \"1-2 sentences\",\\n  \"selected_pages\": [{\"url\": \"\", \"reason\": \"\", \"priority\": 1}]\\n}\\n\\nIf no links look promising, return selected_pages: [] and explain in rationale. Only include URLs from the list above. Never invent URLs.';\n  return JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], response_format: { type: 'json_object' }, temperature: 0.3, max_tokens: 800 });\n})() }}",
+        "options": {
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "de-07",
+      "name": "Parse Page Selection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const resp = $input.first().json;\nconst clean = $('Clean Homepage + Extract Links').first().json;\nconst availableUrls = new Set((clean.links || []).map(function(l){ return l.url; }));\nlet parsed = { rationale: '', selected_pages: [] };\ntry {\n  const content = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n  if (content) parsed = JSON.parse(content);\n} catch(e) { parsed = { rationale: 'LLM JSON parse failed: ' + e.message, selected_pages: [] }; }\nconst valid = (parsed.selected_pages || []).filter(function(p){ return p && p.url && availableUrls.has(p.url); }).slice(0, 5);\nlet selected = valid;\nif (selected.length === 0) {\n  const heuristicPaths = ['/contact', '/about', '/team', '/staff', '/leadership', '/our-team', '/meet-the-team', '/people', '/our-people'];\n  const heuristicMatch = (clean.links || []).filter(function(l){\n    const p = (l.url || '').toLowerCase();\n    return heuristicPaths.some(function(h){ return p.endsWith(h) || p.indexOf(h + '/') >= 0; });\n  }).slice(0, 5);\n  selected = heuristicMatch.map(function(l, i){ return { url: l.url, reason: 'heuristic fallback', priority: i + 1 }; });\n}\nconst rationale = (parsed.rationale || '') + (valid.length === 0 ? ' [LLM returned no valid URLs, used heuristic fallback]' : '');\nif (selected.length === 0) {\n  return [{ json: { _targetUrl: '__SKIP__', _isPlaceholder: true, rationale: rationale, selected_pages: [] } }];\n}\nreturn selected.map(function(p){ return { json: { _targetUrl: p.url, _reason: p.reason, _priority: p.priority, _rationale: rationale, _selected_pages: selected } }; });"
+      }
+    },
+    {
+      "id": "de-08",
+      "name": "Fetch Selected Pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        300
+      ],
+      "continueOnFail": true,
+      "parameters": {
+        "url": "={{ $json._targetUrl === '__SKIP__' ? 'about:blank' : $json._targetUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-US,en;q=0.5"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 5
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "neverError": true
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 3,
+              "batchInterval": 500
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "de-09",
+      "name": "Clean Selected Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        300
+      ],
+      "parameters": {
+        "jsCode": "function stripTags(s) {\n  return String(s || '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\nconst pageItems = $input.all();\nconst selectionItems = $('Parse Page Selection').all();\nconst pages = [];\npageItems.forEach(function(item, idx){\n  const selMeta = (selectionItems[idx] && selectionItems[idx].json) || {};\n  if (selMeta._isPlaceholder) return;\n  const j = item.json || {};\n  const raw = String(j.data || j.body || j || '');\n  if (!raw || raw.length < 50) {\n    pages.push({ url: selMeta._targetUrl, status: 'empty', bytes: raw.length, text: '', reason: selMeta._reason });\n    return;\n  }\n  const text = stripTags(raw).slice(0, 6000);\n  pages.push({ url: selMeta._targetUrl, status: 'ok', bytes: raw.length, text: text, reason: selMeta._reason });\n});\nconst homepageData = $('Clean Homepage + Extract Links').first().json;\nconst firstSel = (selectionItems[0] && selectionItems[0].json) || {};\nreturn [{ json: { homepage_url: homepageData.homepage_url, homepage_text: homepageData.homepage_text, pages: pages, page_count: pages.filter(function(p){ return p.status === 'ok'; }).length, rationale: firstSel._rationale || '', selected_pages: firstSel._selected_pages || [] } }];"
+      }
+    },
+    {
+      "id": "de-10",
+      "name": "LLM: Extract Contacts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        300
+      ],
+      "continueOnFail": true,
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GROQ_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ (function(){\n  var biz = $('Validate Input').first().json.business_name;\n  var d = $json;\n  var parts = ['HOMEPAGE (' + d.homepage_url + '):\\n' + d.homepage_text];\n  (d.pages || []).forEach(function(p){ if (p.status === 'ok' && p.text) { parts.push('==== PAGE: ' + p.url + ' ====\\n' + p.text); } });\n  var combined = parts.join('\\n\\n').slice(0, 28000);\n  var system = 'You are a contact data extractor for a B2B lead-research tool. You read business website pages and pull out ONLY the contact information that belongs to the business itself: owners, founders, managers, staff, directors, named decision-makers. You IGNORE customer reviews, testimonials, ratings, blog comments, and any name that appears alongside review/rating text or in a wedding/event reference. You classify contacts as personal (a named team member of the business) or generic (info@, contact@, hello@, switchboard numbers). You NEVER invent data and you NEVER include placeholder URLs (root social domains like https://www.linkedin.com/ or https://www.facebook.com/ are forbidden). You respond only with valid JSON.';\n  var user = 'Business name: ' + biz + '\\n\\nPages crawled (separated by ====):\\n' + combined + '\\n\\nTASK: Extract contact information that belongs to the BUSINESS, prioritizing personal/team contacts over generic ones.\\n\\nFor each PERSONAL contact (must be a real team member of \"' + biz + '\" - owner, founder, partner, director, manager, chef, head of department, named employee):\\n- name (full name)\\n- title (their role/position at THIS business - required, leave blank only if truly unmarked)\\n- email (direct email if visible)\\n- phone (direct phone if visible)\\n- linkedin (only their actual LinkedIn profile URL: must contain /in/ or /pub/)\\n- source_url (which page you found them on)\\n\\nFor GENERIC contacts (the business itself):\\n- emails (array of info@, contact@, hello@, sales@, etc.)\\n- phones (array of main numbers)\\n- address (string)\\n\\nFor SOCIAL PROFILES of the business itself - ONLY include URLs that point to a SPECIFIC PAGE for this business (e.g. linkedin.com/company/X, facebook.com/X, instagram.com/X, x.com/X, youtube.com/@X). Plain domain roots are forbidden. If you cannot find a specific URL, leave the field empty.\\n\\nReturn ONLY this JSON, no markdown:\\n{\\n  \"personal_contacts\": [{\"name\":\"\",\"title\":\"\",\"email\":\"\",\"phone\":\"\",\"linkedin\":\"\",\"source_url\":\"\"}],\\n  \"generic_contacts\": {\"emails\":[],\"phones\":[],\"address\":\"\"},\\n  \"social_profiles\": {\"linkedin\":\"\",\"facebook\":\"\",\"instagram\":\"\",\"twitter\":\"\",\"youtube\":\"\",\"tiktok\":\"\"},\\n  \"confidence\": 0.0,\\n  \"notes\": \"\"\\n}\\n\\nSTRICT RULES (read carefully):\\n1. DO NOT include names from customer reviews, testimonials, star-ratings, Google review snippets, or wedding-day mentions. If a name appears next to a number of stars or in a quote-style block, it is a customer, not a contact.\\n2. DO NOT include placeholder/root social URLs like https://www.linkedin.com/, https://facebook.com, etc. Only specific profile URLs count.\\n3. DO NOT invent or guess. If you cannot find a value, leave it blank (\"\" or []).\\n4. confidence: 1.0 = found specific named team members with contact info, 0.6 = found named team members but no direct contact, 0.3 = only generic info, 0.0 = nothing useful.\\n5. If you list a personal_contact without an email/phone/linkedin, you MUST have a title or a source_url that proves they are a team member (e.g. found on /team, /about, /founder). Otherwise drop them.\\n6. Deduplicate emails, phones, and contacts across the result.\\n7. notes: explain in 1-2 sentences what you found and any concerns (e.g. \"site has only homepage content\", \"testimonials filtered out\").';\n  return JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: system }, { role: 'user', content: user }], response_format: { type: 'json_object' }, temperature: 0.15, max_tokens: 2500 });\n})() }}",
+        "options": {
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "de-11",
+      "name": "Parse Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const llmResp = $input.first().json;\nconst cleaned = $('Clean Selected Pages').first().json;\nconst startRow = $('Start Deep Enrich Run').first().json;\nconst runRow = Array.isArray(startRow) ? startRow[0] : startRow;\nconst runId = runRow && runRow.id;\nconst startedAt = $('Validate Input').first().json.started_at;\nlet parsed = null;\nlet modelUsed = 'failed';\nlet tokensIn = null;\nlet tokensOut = null;\ntry {\n  if (llmResp.choices && llmResp.choices[0] && llmResp.choices[0].message) {\n    parsed = JSON.parse(llmResp.choices[0].message.content);\n    modelUsed = 'groq-llama3.3-70b';\n  }\n  if (llmResp.usage) {\n    tokensIn = llmResp.usage.prompt_tokens || null;\n    tokensOut = llmResp.usage.completion_tokens || null;\n  }\n} catch(e) {}\nif (!parsed) {\n  parsed = { personal_contacts: [], generic_contacts: { emails: [], phones: [], address: '' }, social_profiles: {}, confidence: 0, notes: 'LLM extraction failed' };\n}\nconst personal = (parsed.personal_contacts || []).filter(function(c){ return c && (c.name || c.email || c.phone); });\nconst generic = parsed.generic_contacts || { emails: [], phones: [], address: '' };\ngeneric.emails = Array.isArray(generic.emails) ? generic.emails.filter(Boolean) : [];\ngeneric.phones = Array.isArray(generic.phones) ? generic.phones.filter(Boolean) : [];\ngeneric.address = String(generic.address || '');\nconst socials = parsed.social_profiles || {};\nconst hasPersonalEmail = personal.some(function(c){ return c.email && c.email.length > 0; });\nconst hasPersonalPhone = personal.some(function(c){ return c.phone && c.phone.length > 0; });\nconst hasOwnerName = personal.some(function(c){ return c.name && c.name.length > 0; });\nconst personalCount = personal.length;\nconst now = new Date();\nconst durationMs = startedAt ? (now.getTime() - new Date(startedAt).getTime()) : null;\nconst pagesVisited = (cleaned.pages || []).map(function(p){ return { url: p.url, status: p.status, bytes: p.bytes, reason: p.reason }; });\npagesVisited.unshift({ url: cleaned.homepage_url, status: 'ok', bytes: (cleaned.homepage_text || '').length, reason: 'homepage' });\nreturn [{ json: { _runId: runId, pages_visited: pagesVisited, page_selection_rationale: cleaned.rationale || '', personal_contacts: personal, generic_contacts: generic, social_profiles: socials, confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0)), llm_notes: String(parsed.notes || '').slice(0, 2000), has_personal_email: hasPersonalEmail, has_personal_phone: hasPersonalPhone, has_owner_name: hasOwnerName, personal_contact_count: personalCount, model_used: modelUsed, tokens_input: tokensIn, tokens_output: tokensOut, status: modelUsed === 'failed' ? 'failed' : 'completed', error_message: modelUsed === 'failed' ? 'LLM extraction failed (see Groq response)' : null, completed_at: now.toISOString(), duration_ms: durationMs } }];"
+      }
+    },
+    {
+      "id": "de-12",
+      "name": "Update Deep Enrich Row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2420,
+        300
+      ],
+      "continueOnFail": true,
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'https://YOUR_SUPABASE_PROJECT_REF.supabase.co/rest/v1/lead_deep_enrichment?id=eq.' + $json._runId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "YOUR_SUPABASE_PUBLISHABLE_KEY"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_SUPABASE_PUBLISHABLE_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ pages_visited: $json.pages_visited, page_selection_rationale: $json.page_selection_rationale, personal_contacts: $json.personal_contacts, generic_contacts: $json.generic_contacts, social_profiles: $json.social_profiles, confidence: $json.confidence, llm_notes: $json.llm_notes, has_personal_email: $json.has_personal_email, has_personal_phone: $json.has_personal_phone, has_owner_name: $json.has_owner_name, personal_contact_count: $json.personal_contact_count, model_used: $json.model_used, tokens_input: $json.tokens_input, tokens_output: $json.tokens_output, status: $json.status, error_message: $json.error_message, completed_at: $json.completed_at, duration_ms: $json.duration_ms }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "de-13",
+      "name": "Build Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const parsed = $('Parse Extraction').first().json;\nconst place_id = $('Validate Input').first().json.place_id;\nreturn [{ json: { success: parsed.status === 'completed', place_id: place_id, deep_enrich_id: parsed._runId, status: parsed.status, summary: { personal_contact_count: parsed.personal_contact_count, has_personal_email: parsed.has_personal_email, has_personal_phone: parsed.has_personal_phone, has_owner_name: parsed.has_owner_name, confidence: parsed.confidence, pages_crawled: (parsed.pages_visited || []).filter(function(p){ return p.status === 'ok'; }).length, duration_ms: parsed.duration_ms, model_used: parsed.model_used }, personal_contacts: parsed.personal_contacts, generic_contacts: parsed.generic_contacts, social_profiles: parsed.social_profiles, llm_notes: parsed.llm_notes, rationale: parsed.page_selection_rationale, error: parsed.error_message } }];"
+      }
+    },
+    {
+      "id": "de-14",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2860,
+        300
+      ],
+      "parameters": {
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Start Deep Enrich Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Deep Enrich Run": {
+      "main": [
+        [
+          {
+            "node": "Fetch Homepage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Homepage": {
+      "main": [
+        [
+          {
+            "node": "Clean Homepage + Extract Links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Homepage + Extract Links": {
+      "main": [
+        [
+          {
+            "node": "LLM: Rank Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: Rank Pages": {
+      "main": [
+        [
+          {
+            "node": "Parse Page Selection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Page Selection": {
+      "main": [
+        [
+          {
+            "node": "Fetch Selected Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Selected Pages": {
+      "main": [
+        [
+          {
+            "node": "Clean Selected Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Selected Pages": {
+      "main": [
+        [
+          {
+            "node": "LLM: Extract Contacts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: Extract Contacts": {
+      "main": [
+        [
+          {
+            "node": "Parse Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Extraction": {
+      "main": [
+        [
+          {
+            "node": "Update Deep Enrich Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Deep Enrich Row": {
+      "main": [
+        [
+          {
+            "node": "Build Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "",
+  "triggerCount": 0,
+  "tags": []
+}
